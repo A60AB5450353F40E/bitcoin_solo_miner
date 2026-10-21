@@ -2,7 +2,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::fs::OpenOptions;
 use std::io::Write;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug, Deserialize)]
 struct Facts {

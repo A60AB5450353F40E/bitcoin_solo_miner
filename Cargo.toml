@@ -1,17 +1,21 @@
 [package]
-name = "bitcoin_solo_miner"
-version = "0.1.1"
+name = "bch_solo_miner"
+version = "0.2.0"
+# `edition = "2024"` needs 1.85; say so instead of implying the project runs on
+# whatever rustc a ten-year-old mining box happens to have.
 edition = "2024"
-authors = ["viraladmin <bc1qks95p0aw09qhfh3e4p7qhr5qtkcg0hnf6erjph>"]
-description = "A bitcoin solo miner for CPUs that changes the metadata each loop instead of nonce."
-keywords = ["bitcoin", "mining", "blockchain", "solo", "educational"]
+rust-version = "1.85"
+authors = ["bitcoincashautist <https://github.com/A60AB5450353F40E>"]
+description = "A Bitcoin Cash solo miner for CPUs that changes the coinbase extra nonce each loop instead of the header nonce."
+# crates.io allows five; more is a publish-time error.
+keywords = ["bitcoin", "bitcoin-cash", "mining", "blockchain", "solo"]
 categories = ["cryptography::cryptocurrencies", "command-line-utilities", "development-tools::debugging"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/viraladmin/bitcoin_solo_miner"
-homepage = "https://github.com/viraladmin/bitcoin_solo_miner"
-documentation = "https://docs.rs/crate/bitcoin_solo_miner"
-
+repository = "https://github.com/A60AB5450353F40E/bitcoin_solo_miner"
+homepage = "https://github.com/A60AB5450353F40E/bitcoin_solo_miner"
+# `.env` is tracked upstream and therefore inside the package set. Without this
+# it would be packed into a published crate with the RPC credentials in it.
 
 [dependencies]
 bitcoin = "0.31.2"
@@ -19,8 +23,13 @@ dotenvy = "0.15"
 hex = "0.4.3"
 tokio = { version = "1", features = ["full"] }
 futures = { version = "0.3", features = ["std"] }
-reqwest = { version = "0.11", features = ["json", "blocking", "rustls-tls"] }
+# rustls only: no OpenSSL on the box that runs this, no dual TLS stacks linked.
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 fastrand = "2.0"
 once_cell = "1.21.3"
+# PoW hot path. Dispatches to SHA-NI (x86) / SHA2 extensions (aarch64) at
+# runtime; `compress` exposes the raw compression function, which lets the
+# padding blocks be built once per batch instead of once per nonce.
+sha2 = { version = "0.10", features = ["compress"] }
