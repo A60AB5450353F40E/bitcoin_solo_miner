@@ -109,7 +109,11 @@ fn parse_addresses(bytes: &[u8]) -> MinerResult<(Vec<String>, usize)> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if !seen.insert(line.to_string()) {
+        let canonical = match line.strip_prefix("0x").or_else(|| line.strip_prefix("0X")) {
+            Some(hex) => format!("0x{}", hex.to_ascii_lowercase()),
+            None => line.to_string(),
+        };
+        if !seen.insert(canonical) {
             continue;
         }
         match payout_script(line) {
@@ -147,8 +151,8 @@ impl AddressBook {
         let (addresses, skipped) = parse_addresses(&bytes)?;
         if addresses.is_empty() {
             return Err(format!(
-                "{} has no usable payout addresses (need legacy P2PKH 1…/P2SH 3…, \
-                 not bc1q and not cashaddr)",
+                "{} has no usable payout addresses (need legacy P2PKH 1…/P2SH 3… \
+                 or a 0x… script, not bc1q and not cashaddr)",
                 path.display()
             )
             .into());

@@ -296,13 +296,53 @@ pub fn load_sentences_from_file(path: &str) -> MinerResult<()> {
 // Payout
 // ---------------------------------------------------------------------------
 
-/// Turns a payout address into a script, refusing anything that is not valid on
-/// BCH. `bc1…` is a Bitcoin SegWit encoding: on BCH the resulting `OP_0 <20b>`
-/// output is anyone-can-spend, so a block paying it would be swept instantly.
+/// `MAX_SCRIPT_SIZE`, enforced in `EvalScript`. A longer scriptPubKey is legal
+/// to create but could never be spent, so it is refused here.
+const MAX_SCRIPT_BYTES: usize = 10_000;
+
+/// Parses the hex payload of a `0x…` payout spec into a script, verbatim.
+///
+/// `CheckTransaction` does not apply standardness to coinbase outputs, so a
+/// nonstandard script here is legal. Whether the coins are spendable
+/// is a separate question that only the operator can answer.
+fn raw_script(hex_script: &str) -> MinerResult<ScriptBuf> {
+    let bytes = hex::decode(hex_script).map_err(|e| format!("0x script is not hex: {e}"))?;
+    if bytes.len() > MAX_SCRIPT_BYTES {
+        return Err(format!(
+            "0x script is {} bytes; the consensus script limit is {MAX_SCRIPT_BYTES}",
+            bytes.len()
+        )
+        .into());
+    }
+    // No emptiness check: a zero-length scriptPubKey is consensus-valid and
+    // serializes as a single 0x00 length byte. It is also anyone-can-spend, so
+    // it is a donation rather than a burn.
+    Ok(ScriptBuf::from_bytes(bytes))
+}
+
+/// Turns a payout spec into a script.
+///
+/// Two forms are accepted:
+///
+/// - A legacy base58 address (`1…` P2PKH, `3…` P2SH), validated by type.
+/// - `0x` followed by a scriptPubKey in hex, used verbatim as the output
+///   script. This is the escape hatch for output types this build cannot
+///   parse: bare multisig, nonstandard scripts, cashaddr before someone writes
+///   the decoder. It deliberately performs no decoding, network or type check,
+///   so the miner cannot tell whether the result is spendable.
+///
+/// `bc1…` is a Bitcoin SegWit encoding: on BCH the resulting `OP_0 <20b>`
+/// output is anyone-can-spend, so it is rejected by prefix and again by type.
 pub fn payout_script(address: &str) -> MinerResult<ScriptBuf> {
     let addr = address.trim();
     let lower = addr.to_ascii_lowercase();
 
+    // `0x` cannot collide with an address prefix, and taking this path before
+    // address parsing keeps the two forms independent. `strip_prefix` rather
+    // than a byte slice: no char-boundary assumption to reason about.
+    if let Some(hex_script) = addr.strip_prefix("0x").or_else(|| addr.strip_prefix("0X")) {
+        return raw_script(hex_script);
+    }
     if lower.starts_with("bc1") || lower.starts_with("tb1") || lower.starts_with("bcrt1") {
         return Err(format!(
             "{addr}: bech32 is a Bitcoin (SegWit) encoding, not a BCH address; that \
@@ -1003,5 +1043,48 @@ mod tests {
             assert!(time >= curtime, "curtime={curtime}");
             assert!(time >= i.mintime, "curtime={curtime}");
         }
+    }
+
+    #[test]
+    fn raw_script_payout_is_used_verbatim() {
+        // OP_DUP OP_HASH160 <20 zero bytes> OP_EQUALVERIFY OP_CHECKSIG: a
+        // well-formed P2PKH script whose hash nobody holds.
+        let hex_script = concat!("76a914", "0000000000000000000000000000000000000000", "88ac",);
+
+        let script = payout_script(&format!("0x{hex_script}")).unwrap();
+        assert_eq!(
+            script.as_bytes(),
+            hex::decode(hex_script).unwrap().as_slice()
+        );
+
+        // Prefix is case-insensitive; payload case is preserved.
+        assert_eq!(
+            payout_script(&format!("0X{}", hex_script.to_uppercase())).unwrap(),
+            script
+        );
+    }
+
+    #[test]
+    fn non_standard_raw_script_is_accepted() {
+        // Consensus-valid: coinbase outputs are not standardness-checked and
+        // serialization emits a zero-length varint. Anyone-can-spend, because
+        // an empty scriptPubKey leaves whatever the scriptSig pushed on top of
+        // the stack, so any truthy push claims it.
+        let script = payout_script("0x").unwrap();
+        assert!(script.as_bytes().is_empty());
+
+        // OP_1 is the same failure mode, and a good way to see it: valid script,
+        // spendable by anyone.
+        assert_eq!(payout_script("0x51").unwrap().as_bytes(), &[0x51]);
+
+        // An undefined opcode is genuinely unspendable: EvalScript fails.
+        assert_eq!(payout_script("0xbeef").unwrap().as_bytes(), &[0xbe, 0xef]);
+    }
+
+    #[test]
+    fn malformed_raw_scripts_are_refused() {
+        assert!(payout_script("0xabc").is_err()); // odd number of digits
+        assert!(payout_script("0xzz").is_err()); // not hex
+        assert!(payout_script("0xab").is_ok()); // one byte is a script
     }
 }

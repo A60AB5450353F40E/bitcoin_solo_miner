@@ -3,6 +3,29 @@
 Releases up to 0.1.2 are from the upstream Bitcoin miner this repository was
 forked from; 0.2.0 is the first Bitcoin Cash release of this fork.
 
+## [0.2.1] - 2026-10-25
+
+### Added
+- A payout line may be a raw scriptPubKey in hex prefixed `0x`, used verbatim as
+  the coinbase output script. No address decoding, network check or type check
+  happens on this form; it exists for output types this build cannot parse (bare
+  multisig, nonstandard scripts, cashaddr until someone writes the decoder). The
+  miner cannot tell whether such a script is spendable, so a malformed entry
+  either burns the reward or donates it to whoever spends it first. An empty
+  `0x` is accepted and produces a zero-length script, and the payload is capped
+  at `MAX_SCRIPT_SIZE`, 10,000 bytes.
+- The shipped `addresses.txt` now also contains `0x` and `0x51`.
+
+### Changed
+- The shipped `.env` sets `ADDRESS_MODE="loop"`, so a fresh clone keeps mining.
+  The code default when the variable is unset is still `once`.
+
+### Notes
+- Every address in the shipped `addresses.txt` is anyone-can-spend on purpose,
+  as a testnet fixture: `0x` locking script is spendable with `0x51` unlocking
+  script and `0x51` with `0x`, and the P2SH address's redeem script is `0x51`,
+  i.e. `OP_1`. Replace them before mining anywhere the coins have value.
+
 ## [0.2.0] - 2026-10-20
 
 ### Breaking

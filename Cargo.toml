@@ -1,6 +1,6 @@
 [package]
 name = "bch_solo_miner"
-version = "0.2.0"
+version = "0.2.1"
 # `edition = "2024"` needs 1.85; say so instead of implying the project runs on
 # whatever rustc a ten-year-old mining box happens to have.
 edition = "2024"

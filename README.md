@@ -33,7 +33,7 @@ RPC_USER="admin"
 RPC_PASS="pass"
 PAYOUT_ADDRESSES="addresses.txt"
 STRINGS_FILE="strings.txt"
-ADDRESS_MODE="once"
+ADDRESS_MODE="loop"
 ADDRESSES_STATE="addresses.txt.state"
 NUM_TASKS=20
 MIN_DIFFICULTY_RULE="auto"
@@ -71,7 +71,13 @@ Legacy base58 (`1…`, `3…`) is byte-identical on Bitcoin and BCH, so it works
 - `bc1…` / `tb1…` — bech32 is a Bitcoin (SegWit) encoding that does not exist on BCH. The resulting `OP_0 <20 bytes>` output would be **spendable by anyone**, so such lines are skipped with a warning.
 - `bitcoincash:…` — cashaddr needs a real base32+polymod decoder, which is not implemented yet. Use the legacy encoding of the same key.
 
-Duplicate lines and lines starting with `#` are ignored.
+A line may instead be a raw scriptPubKey in hex, prefixed `0x`, used verbatim as the coinbase output script:
+
+```
+0x76a914<20-byte hash160 in hex>88ac
+```
+
+Nothing is decoded and nothing is checked — not the node's chain, not the script type — so the miner cannot tell whether the resulting output is spendable. A typo produces a block that pays an unspendable script, or one anyone can spend; either way the reward is gone. A bare `0x` is accepted and produces an empty script, which is also anyone-can-spend. The payload is capped at the consensus `MAX_SCRIPT_SIZE` of 10,000 bytes.
 
 ---
 
@@ -136,7 +142,11 @@ directly; `cumulative` is the lifetime hash count.
   slower than the "twice as fast" claim in the release notes. `[bench]` at
   startup reports what this machine actually does.
 - Mining requires a fully synced node: templates come from the node, including `bits`, `coinbasevalue` and `sizelimit`. The miner never recomputes difficulty.
-- Payout scripts must be P2PKH or P2SH; anything else is rejected before mining starts.
+- Payout scripts are P2PKH, P2SH, or a raw `0x` scriptPubKey. The `0x` form is not checked for spendability, and the addresses shipped in `addresses.txt` are anyone-can-spend on purpose, as a testnet fixture.
+- Every address in the shipped `addresses.txt` is anyone-can-spend on purpose,
+  as a testnet fixture: `0x` locking script is spendable with `0x51` unlocking
+  script and `0x51` with `0x`, and the P2SH address's redeem script is `0x51`,
+  i.e. `OP_1`. Replace them before mining anywhere the coins have value.
 - Nothing in the RPC surface exposes `fPowAllowMinDifficultyBlocks`, so `auto` infers it from the chain name. If the node does not report the chain as `main` yet runs without the rule (or vice versa), set `MIN_DIFFICULTY_RULE` explicitly.
 - Timestamps come from the local clock, so a drifting system clock still matters for the non-pinned case; keep NTP running.
 - `NUM_TASKS` above the usable CPU count is clamped, and SHA-NI is latency-bound, so a small oversubscription can occasionally win on some–core boxes; measure rather than assume.
