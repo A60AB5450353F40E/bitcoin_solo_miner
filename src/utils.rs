@@ -1024,6 +1024,49 @@ mod tests {
     }
 
     #[test]
+    fn raw_script_payout_is_used_verbatim() {
+        // OP_DUP OP_HASH160 <20 zero bytes> OP_EQUALVERIFY OP_CHECKSIG: a
+        // well-formed P2PKH script whose hash nobody holds.
+        let hex_script = concat!("76a914", "0000000000000000000000000000000000000000", "88ac",);
+
+        let script = payout_script(&format!("0x{hex_script}")).unwrap();
+        assert_eq!(
+            script.as_bytes(),
+            hex::decode(hex_script).unwrap().as_slice()
+        );
+
+        // Prefix is case-insensitive; payload case is preserved.
+        assert_eq!(
+            payout_script(&format!("0X{}", hex_script.to_uppercase())).unwrap(),
+            script
+        );
+    }
+
+    #[test]
+    fn non_standard_raw_script_is_accepted() {
+        // Consensus-valid: coinbase outputs are not standardness-checked and
+        // serialization emits a zero-length varint. Anyone-can-spend, because
+        // an empty scriptPubKey leaves whatever the scriptSig pushed on top of
+        // the stack, so any truthy push claims it.
+        let script = payout_script("0x").unwrap();
+        assert!(script.as_bytes().is_empty());
+
+        // OP_1 is the same failure mode, and a good way to see it: valid script,
+        // spendable by anyone.
+        assert_eq!(payout_script("0x51").unwrap().as_bytes(), &[0x51]);
+
+        // An undefined opcode is genuinely unspendable: EvalScript fails.
+        assert_eq!(payout_script("0xbeef").unwrap().as_bytes(), &[0xbe, 0xef]);
+    }
+
+    #[test]
+    fn malformed_raw_scripts_are_refused() {
+        assert!(payout_script("0xabc").is_err()); // odd number of digits
+        assert!(payout_script("0xzz").is_err()); // not hex
+        assert!(payout_script("0xab").is_ok()); // one byte is a script
+    }
+
+    #[test]
     fn predicted_size_counts_header_and_varint() {
         // 1 tx (just a coinbase): 80 header + 1 varint + coinbase.
         assert_eq!(predicted_block_size(100, 1, 0), 181);
@@ -1031,6 +1074,119 @@ mod tests {
         assert_eq!(predicted_block_size(100, 300, 1_000), 80 + 3 + 100 + 1_000);
         // Exactly at the boundary: 0xfd txs needs the extended form.
         assert_eq!(predicted_block_size(100, 0xfd, 0), 80 + 3 + 100);
+    }
+
+    fn coinbase_with(height: u32, aux: &[u8], extra: Extranonce, lock_time: u32) -> Transaction {
+        let spk = payout_script("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").unwrap();
+        build_coinbase_tx(height, aux, extra, 5_000_000_000, &spk, lock_time).unwrap()
+    }
+
+    #[test]
+    fn counter_extranonce_is_a_minimal_script_number_push() {
+        // Height 100 -> push `01 64`; counter 5 -> OP_5.
+        let tx = coinbase_with(100, &[], Extranonce::ScriptNum(5), 0);
+        assert_eq!(tx.input[0].script_sig.as_bytes(), &[0x01u8, 0x64, 0x55][..]);
+
+        // 0 -> OP_0. Past OP_16, so 17 becomes a one-byte data push.
+        let tx = coinbase_with(100, &[], Extranonce::ScriptNum(0), 0);
+        assert_eq!(tx.input[0].script_sig.as_bytes(), &[0x01u8, 0x64, 0x00][..]);
+        let tx = coinbase_with(100, &[], Extranonce::ScriptNum(17), 0);
+        assert_eq!(
+            tx.input[0].script_sig.as_bytes(),
+            &[0x01u8, 0x64, 0x01, 0x11][..]
+        );
+
+        // Aux flags sit between the height push and the counter.
+        let tx = coinbase_with(100, &[0xaa], Extranonce::ScriptNum(5), 0);
+        assert_eq!(
+            tx.input[0].script_sig.as_bytes(),
+            &[0x01u8, 0x64, 0xaa, 0x55][..]
+        );
+    }
+
+    #[test]
+    fn text_extranonce_is_appended_verbatim() {
+        let tx = coinbase_with(100, &[], Extranonce::Text(b"hi".to_vec()), 0);
+        assert_eq!(
+            tx.input[0].script_sig.as_bytes(),
+            &[0x01u8, 0x64, b'h', b'i'][..]
+        );
+    }
+
+    #[test]
+    fn distinct_counters_give_distinct_coinbases() {
+        let a = coinbase_with(100, &[], Extranonce::ScriptNum(1), 0);
+        let b = coinbase_with(100, &[], Extranonce::ScriptNum(2), 0);
+        assert_ne!(a.txid(), b.txid());
+    }
+
+    #[test]
+    fn counter_values_stay_inside_the_script_number_range() {
+        // The regression: a full-range random seed exceeds i64::MAX, and half of
+        // all seeds do, so every coinbase derived from one failed to encode.
+        seed_counter(u64::MAX);
+        for _ in 0..4 {
+            let n = next_counter();
+            assert!(n >= 0, "counter {n} is not a non-negative script number");
+        }
+
+        // Exactly at the boundary is still encodable, then it wraps to zero.
+        seed_counter(i64::MAX as u64);
+        assert_eq!(next_counter(), i64::MAX);
+        assert_eq!(next_counter(), 0);
+
+        // The mask does not disturb ordinary values.
+        seed_counter(0);
+        assert_eq!(next_counter(), 0);
+        assert_eq!(next_counter(), 1);
+    }
+
+    #[test]
+    fn minimal_nonce_encodes_to_four_bytes() {
+        for _ in 0..2_000 {
+            let (script_num, lock_time) = minimal_nonce();
+
+            // Forced bit 22 keeps the top byte non-zero; cleared bit 23 keeps it
+            // positive without a sign pad. Together: exactly three payload bytes.
+            assert!(
+                (0x40_0000..=0x7f_ffff).contains(&script_num),
+                "{script_num:#x} outside 0x400000..=0x7fffff"
+            );
+            assert!(lock_time <= u32::from(u16::MAX));
+
+            let push = Builder::new().push_int(script_num).into_script();
+            assert_eq!(push.as_bytes().len(), 4, "{script_num:#x}");
+            assert_eq!(push.as_bytes()[0], 0x03, "{script_num:#x}");
+        }
+    }
+
+    #[test]
+    fn minimal_coinbase_is_sixty_five_bytes_at_height_one() {
+        // Empty payout script, OP_1 for the height, and the four-byte nonce
+        // push: the smallest coinbase that clears
+        // MIN_STANDARD_TX_NONWITNESS_SIZE, which is checked with `<` so 65 passes
+        // and 64 does not.
+        let empty = ScriptBuf::new();
+        let tx = build_coinbase_tx(
+            1,
+            &[],
+            Extranonce::ScriptNum(i64::from(0x40_0000u32)),
+            1,
+            &empty,
+            0xdead,
+        )
+        .unwrap();
+
+        assert_eq!(serialized_size(&tx).unwrap(), 65);
+        assert_eq!(
+            tx.input[0].script_sig.as_bytes(),
+            &[0x51, 0x03, 0x00, 0x00, 0x40]
+        );
+
+        // The entropy in nLockTime is carried, and the input stays final so the
+        // coinbase would be final even if a rule started checking it.
+        assert_eq!(tx.lock_time, LockTime::from_consensus(0xdead));
+        assert_eq!(tx.input[0].sequence, Sequence::MAX);
     }
 
     fn tempnet(now: u64, curtime: u64, mintime: u64) -> TimestampInputs {
@@ -1133,48 +1289,5 @@ mod tests {
             assert!(time >= curtime, "curtime={curtime}");
             assert!(time >= i.mintime, "curtime={curtime}");
         }
-    }
-
-    #[test]
-    fn raw_script_payout_is_used_verbatim() {
-        // OP_DUP OP_HASH160 <20 zero bytes> OP_EQUALVERIFY OP_CHECKSIG: a
-        // well-formed P2PKH script whose hash nobody holds.
-        let hex_script = concat!("76a914", "0000000000000000000000000000000000000000", "88ac",);
-
-        let script = payout_script(&format!("0x{hex_script}")).unwrap();
-        assert_eq!(
-            script.as_bytes(),
-            hex::decode(hex_script).unwrap().as_slice()
-        );
-
-        // Prefix is case-insensitive; payload case is preserved.
-        assert_eq!(
-            payout_script(&format!("0X{}", hex_script.to_uppercase())).unwrap(),
-            script
-        );
-    }
-
-    #[test]
-    fn non_standard_raw_script_is_accepted() {
-        // Consensus-valid: coinbase outputs are not standardness-checked and
-        // serialization emits a zero-length varint. Anyone-can-spend, because
-        // an empty scriptPubKey leaves whatever the scriptSig pushed on top of
-        // the stack, so any truthy push claims it.
-        let script = payout_script("0x").unwrap();
-        assert!(script.as_bytes().is_empty());
-
-        // OP_1 is the same failure mode, and a good way to see it: valid script,
-        // spendable by anyone.
-        assert_eq!(payout_script("0x51").unwrap().as_bytes(), &[0x51]);
-
-        // An undefined opcode is genuinely unspendable: EvalScript fails.
-        assert_eq!(payout_script("0xbeef").unwrap().as_bytes(), &[0xbe, 0xef]);
-    }
-
-    #[test]
-    fn malformed_raw_scripts_are_refused() {
-        assert!(payout_script("0xabc").is_err()); // odd number of digits
-        assert!(payout_script("0xzz").is_err()); // not hex
-        assert!(payout_script("0xab").is_ok()); // one byte is a script
     }
 }
