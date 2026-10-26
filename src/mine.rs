@@ -5,7 +5,7 @@ use crate::utils::{
     TAIL_BYTES, TAIL_NONCE_OFFSET, TimestampInputs, bits_to_target, build_coinbase_tx,
     meets_target, payout_script, predicted_block_size, serialize_header_to_array, serialized_size,
 };
-use crate::{GLOBAL_TEMPLATE, PAYOUT_ADDRESS, SENTENCES};
+use crate::{BLOCK_TARGET, BLOCKS_ACCEPTED, GLOBAL_TEMPLATE, PAYOUT_ADDRESS, SENTENCES, STOPPING};
 use bitcoin::hashes::Hash;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -171,11 +171,25 @@ fn search_batch(mut job: MiningJob) -> Option<MinedBlock> {
 }
 
 pub async fn mine_loop() -> MinerResult<Option<MinedBlock>> {
+    // The run's target was reached, so no new search starts. A worker already
+    // in a batch finishes it and may still submit; `main` is about to return.
+    if STOPPING.load(Ordering::Relaxed) {
+        tokio::time::sleep(IDLE_SLEEP).await;
+        return Ok(None);
+    }
+
     let payout_address = match &*PAYOUT_ADDRESS.read().await {
         Some(addr) => addr.clone(),
         None => {
-            // Nothing selected: either no addresses loaded, or a `once` list that
-            // has been used up.
+            // With a target set an empty list is fatal: no candidate can ever
+            // be produced, so a wrapper would wait on RUN_DONE forever.
+            if BLOCK_TARGET.get().is_some() {
+                crate::fail(format!(
+                    "no payout address with --count set, after {} accepted block(s); \
+                     add addresses or set ADDRESS_MODE=loop",
+                    BLOCKS_ACCEPTED.load(Ordering::Relaxed),
+                ));
+            }
             tokio::time::sleep(IDLE_SLEEP).await;
             return Ok(None);
         }

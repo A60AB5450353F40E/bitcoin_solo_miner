@@ -17,11 +17,11 @@ use utils::{
 };
 
 use dotenvy::var;
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use reqwest::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, RwLock};
 
@@ -44,6 +44,94 @@ pub static PAYOUT_ADDRESS: Lazy<RwLock<Option<String>>> = Lazy::new(|| RwLock::n
 /// Signalled after a submitted block so the updater drops its longpoll and
 /// fetches the next template immediately.
 pub static REFRESH: Lazy<Notify> = Lazy::new(Notify::new);
+
+/// Blocks this run submitted and the node accepted. Duplicates and rejections
+/// are not counted: neither proves this run found anything.
+pub static BLOCKS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+
+/// `--count N`: exit successfully once this many blocks have been accepted.
+/// Unset mines forever.
+pub static BLOCK_TARGET: OnceCell<u64> = OnceCell::new();
+
+/// Set when the target is reached, so workers stop starting new searches
+/// instead of racing for the block after the one that completed the run.
+pub static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// Woken when the target is reached so `main` can return.
+static RUN_DONE: Lazy<Notify> = Lazy::new(Notify::new);
+
+/// Why the run ended unsuccessfully, if it did. Read once by `main`.
+static RUN_ERROR: Lazy<std::sync::Mutex<Option<String>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+
+const USAGE: &str = "\
+usage: bch_solo_miner [--count N]
+
+  -n, --count N   mine N blocks, then exit 0
+  -h, --help      show this message
+
+Everything else comes from .env.";
+
+#[derive(Debug, Default)]
+struct Args {
+    /// Mine this many accepted blocks, then exit successfully.
+    /// `None` mines until interrupted.
+    count: Option<u64>,
+}
+
+fn usage_error(message: &str) -> ! {
+    eprintln!("{message}\n\n{USAGE}");
+    std::process::exit(2);
+}
+
+fn parse_count(raw: &str) -> u64 {
+    match raw.parse::<u64>() {
+        Ok(0) => usage_error("--count must be at least 1"),
+        Ok(n) => n,
+        Err(_) => usage_error(&format!("--count {raw:?} is not a positive integer")),
+    }
+}
+
+fn parse_args() -> MinerResult<Args> {
+    let mut args = Args::default();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-n" | "--count" => {
+                i += 1;
+                let raw = match argv.get(i) {
+                    Some(v) => v,
+                    None => usage_error("--count needs a value"),
+                };
+                args.count = Some(parse_count(raw));
+            }
+            other => match other.strip_prefix("--count=") {
+                Some(raw) => args.count = Some(parse_count(raw)),
+                None => usage_error(&format!("unknown argument {other:?}; try --help")),
+            },
+        }
+        i += 1;
+    }
+
+    Ok(args)
+}
+
+/// Credits one accepted block and, on reaching the target, tells the workers to
+/// stop starting new searches and wakes `main`.
+fn record_accepted_block() {
+    let accepted = BLOCKS_ACCEPTED.fetch_add(1, Ordering::Relaxed) + 1;
+    let reached = BLOCK_TARGET.get().is_some_and(|target| accepted >= *target);
+    if reached {
+        STOPPING.store(true, Ordering::Relaxed);
+        RUN_DONE.notify_one();
+    }
+}
 
 fn load_dotenv() -> MinerResult<PathBuf> {
     if let Ok(explicit) = var("DOTENV_PATH") {
@@ -159,6 +247,18 @@ fn min_diff_state(t: &BlockTemplate, now: u64) -> String {
     }
 }
 
+/// Ends the run with a reason: workers stop starting searches, `main` wakes and
+/// exits 1.
+pub fn fail(reason: impl Into<String>) {
+    let mut slot = match RUN_ERROR.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    slot.get_or_insert(reason.into());
+    STOPPING.store(true, Ordering::Relaxed);
+    RUN_DONE.notify_one();
+}
+
 async fn mine_and_submit(
     client: &Client,
     rpc_url: &str,
@@ -191,6 +291,9 @@ async fn mine_and_submit(
             if let Err(e) = advance_after_block(&payout_address).await {
                 eprintln!("[sub] warning: failed to advance payout address: {e}");
             }
+            // Last: the cursor above is already on disk, so an exit triggered
+            // here cannot lose it.
+            record_accepted_block();
         }
         Ok(SubmitOutcome::Duplicate) => {
             // The node already had this block. It may be our own earlier
@@ -287,8 +390,16 @@ fn spawn_stats(bench_rate: f64) {
 
 #[tokio::main]
 async fn main() -> MinerResult<()> {
+    // Parsed before `.env` so `--help` works outside a configured checkout.
+    let args = parse_args()?;
+
     let env_path = load_dotenv()?;
     println!("[env] loaded {}", env_path.display());
+
+    if let Some(target) = args.count {
+        let _ = BLOCK_TARGET.set(target);
+        println!("[run] will exit after {target} accepted block(s)");
+    }
 
     let num_tasks = resolve_num_tasks(
         var("NUM_TASKS")
@@ -383,6 +494,30 @@ async fn main() -> MinerResult<()> {
         }
     }
 
-    futures::future::pending::<()>().await;
+    match BLOCK_TARGET.get() {
+        Some(target) => {
+            RUN_DONE.notified().await;
+            let accepted = BLOCKS_ACCEPTED.load(Ordering::Relaxed);
+            let error = match RUN_ERROR.lock() {
+                Ok(mut g) => g.take(),
+                Err(p) => p.into_inner().take(),
+            };
+            if let Some(reason) = error {
+                // The count decides, not the error. A worker that saw the
+                // exhausted address list between the winning worker's cursor
+                // advance and its record_accepted_block call reports a failure
+                // for a run that met its target.
+                if accepted < *target {
+                    eprintln!("{reason}");
+                    std::process::exit(1);
+                }
+                eprintln!("[run] note: {reason} (target already met)");
+            }
+            println!("[run] accepted {accepted} block(s), target {target}; exiting");
+        }
+        // No target: mine until the process is killed.
+        None => futures::future::pending::<()>().await,
+    }
+
     Ok(())
 }
