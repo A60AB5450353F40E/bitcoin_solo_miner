@@ -3,7 +3,8 @@ use crate::block_template::{BlockTemplate, check_target_time, fetch_parent_time}
 use crate::fetch_block_template;
 use crate::merkle::{CachedTemplate, LAST_TXS, precompute_merkle_branch};
 use crate::utils::{
-    MIN_DIFFICULTY_RULE, MinerResult, RpcTimeout, TARGET_TIME, min_difficulty_boundary,
+    MIN_DIFFICULTY_RULE, MinerResult, RpcTimeout, TARGET_TIME, difficulty_from_bits,
+    format_difficulty, min_difficulty_boundary,
 };
 use bitcoin::hashes::Hash;
 use reqwest::Client;
@@ -188,6 +189,14 @@ pub fn update_block(client: Arc<Client>, rpc_url: String, rpc_user: String, rpc_
                     let tip = template.previousblockhash.clone();
                     let height = template.height;
                     let bits = template.bits.clone();
+                    // Parsed again here rather than threaded through from
+                    // `mine_loop`: this runs once per distinct template, and
+                    // keeping the log self-contained is worth the parse.
+                    let diff = u32::from_str_radix(&bits, 16)
+                        .ok()
+                        .and_then(difficulty_from_bits)
+                        .map(format_difficulty)
+                        .unwrap_or_else(|| "?".to_string());
                     let n_tx = template.transactions.len();
                     let sizelimit = template.sizelimit;
                     let tau = template.target_time;
@@ -218,9 +227,9 @@ pub fn update_block(client: Arc<Client>, rpc_url: String, rpc_user: String, rpc_
                                 *GLOBAL_TEMPLATE.write().await = Some((template_arc, fp));
                                 if last_logged != Some(fp) {
                                     println!(
-                                        "[tpl] height={height} prev={tip} bits={bits} tau={tau}s \
-                                         txs={n_tx} sizelimit={sizelimit:?} \
-                                         min_diff_at={min_diff_at}"
+                                        "[tpl] height={height} prev={tip} bits={bits} \
+                                         diff={diff} tau={tau}s txs={n_tx} \
+                                         sizelimit={sizelimit:?} min_diff_at={min_diff_at}"
                                     );
                                     last_logged = Some(fp);
                                 }
@@ -376,5 +385,23 @@ mod tests {
 
         // Equal is `<=`, matching the node's `uint256` comparison.
         assert!(uint256_le(&internal(high), &internal(high)));
+    }
+
+    #[test]
+    fn difficulty_matches_the_node_scale() {
+        // powLimit on mainnet, testnet and tempnet is difficulty 1 by definition.
+        assert_eq!(difficulty_from_bits(0x1d00ffff), Some(1.0));
+
+        // From the tempnet logs: bits=1c64986b, which the node reports as ~2.54.
+        let d = difficulty_from_bits(0x1c64986b).unwrap();
+        assert!((d - 2.545).abs() < 0.001, "{d}");
+
+        // A larger mantissa is a larger target, so a lower difficulty.
+        assert!(difficulty_from_bits(0x1c7fffff).unwrap() < d);
+
+        // Unusable compact values are refused, as in bits_to_target.
+        assert!(difficulty_from_bits(0x00000000).is_none());
+        assert!(difficulty_from_bits(0x1d000000).is_none());
+        assert!(difficulty_from_bits(0x2100ffff).is_none());
     }
 }

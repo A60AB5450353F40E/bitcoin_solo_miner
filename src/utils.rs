@@ -591,6 +591,47 @@ pub fn bits_to_target(bits: u32) -> Option<[u8; 32]> {
     Some(target)
 }
 
+/// Difficulty with Bitcoin's `0x00000000FFFF0000…` target as 1.0, the scale
+/// `getblockchaininfo`, `getblock` and every explorer report.
+///
+/// Mirrors Core's `GetDifficulty`: `0x0000ffff` over the mantissa, scaled by 256
+/// for each exponent step away from `0x1d`. `None` when `bits` cannot describe a
+/// target, matching `bits_to_target`.
+///
+/// A chain whose `powLimit` is not `0x1d00ffff` disagrees with its own node
+/// here: Core returns 1.0 whenever `bits` equals the chain's `powLimit`, and
+/// regtest's is `0x207fffff`, which this formula places near 4.7e-10. Tempnet,
+/// testnet and mainnet all use `0x1d00ffff`, so the number is exact there —
+/// including the 1.0 that the minimum-difficulty drop produces.
+pub fn difficulty_from_bits(bits: u32) -> Option<f64> {
+    // Reuse the expansion so the validity rules stay in one place: zero
+    // mantissa, zero exponent, and exponents past 32.
+    bits_to_target(bits)?;
+
+    let exponent = ((bits >> 24) & 0xff) as i32;
+    let mantissa = (bits & 0x007f_ffff) as f64;
+    // `powi` takes a negative exponent, so the same expression covers targets
+    // harder than difficulty 1 as well as easier ones.
+    Some((0xffff as f64 / mantissa) * 256f64.powi(29 - exponent))
+}
+
+/// Compact `f64` for a log line: no exponent until the number is genuinely
+/// large, and no long tails for test-chain difficulties around 1–10.
+pub fn format_difficulty(difficulty: f64) -> String {
+    if !difficulty.is_finite() {
+        return "inf".into();
+    }
+    if difficulty >= 1e6 {
+        format!("{difficulty:.3e}")
+    } else if difficulty >= 100.0 {
+        format!("{difficulty:.1}")
+    } else if difficulty >= 1.0 {
+        format!("{difficulty:.4}")
+    } else {
+        format!("{difficulty:.6}")
+    }
+}
+
 pub fn serialize_header_to_array(header: &BlockHeader) -> [u8; 80] {
     let mut buf = [0u8; 80];
     let mut i = 0;
