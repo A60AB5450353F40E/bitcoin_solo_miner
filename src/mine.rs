@@ -1,9 +1,10 @@
 use crate::block_template::check_target_time;
 use crate::merkle::{LAST_TXS, compute_root_from_branch};
 use crate::utils::{
-    FALLBACK_MAX_BLOCK_BYTES, MIDSTATE_BYTES, MIN_DIFFICULTY_RULE, Midstate, MinerResult,
-    TAIL_BYTES, TAIL_NONCE_OFFSET, TimestampInputs, bits_to_target, build_coinbase_tx,
-    meets_target, payout_script, predicted_block_size, serialize_header_to_array, serialized_size,
+    COUNTER_EXTRANONCE, Extranonce, FALLBACK_MAX_BLOCK_BYTES, MIDSTATE_BYTES, MIN_DIFFICULTY_RULE,
+    Midstate, MinerResult, TAIL_BYTES, TAIL_NONCE_OFFSET, TimestampInputs, bits_to_target,
+    build_coinbase_tx, meets_target, next_counter, payout_script, predicted_block_size,
+    serialize_header_to_array, serialized_size,
 };
 use crate::{BLOCK_TARGET, BLOCKS_ACCEPTED, GLOBAL_TEMPLATE, PAYOUT_ADDRESS, SENTENCES, STOPPING};
 use bitcoin::hashes::Hash;
@@ -255,7 +256,13 @@ pub async fn mine_loop() -> MinerResult<Option<MinedBlock>> {
         _ => Vec::new(),
     };
 
-    let sentence = pick_random_sentence();
+    // Counter mode removes the strings-file dependency and makes the coinbase
+    // unique by construction; strings mode keeps the sentence corpus.
+    let extra = if COUNTER_EXTRANONCE.load(Ordering::Relaxed) {
+        Extranonce::Counter(next_counter())
+    } else {
+        Extranonce::Text(pick_random_sentence().into_bytes())
+    };
 
     // Single coinbase. No dummy pass, no wtxid tree, no commitment output.
     // `coinbasevalue` is used verbatim because every template transaction is in
@@ -263,7 +270,7 @@ pub async fn mine_loop() -> MinerResult<Option<MinedBlock>> {
     let coinbase_tx = build_coinbase_tx(
         template.height as u32,
         &aux_flags,
-        sentence.as_bytes(),
+        extra,
         template.coinbasevalue,
         &payout_spk,
     )?;

@@ -12,8 +12,9 @@ use mine::mine_loop;
 
 mod utils;
 use utils::{
-    MIN_DIFFICULTY_RULE, MinerResult, RpcTimeout, SubmitOutcome, TARGET_TIME, TimestampMode,
-    build_full_block, load_sentences_from_file, min_difficulty_boundary, preflight, submit_block,
+    COUNTER_EXTRANONCE, MIN_DIFFICULTY_RULE, MinerResult, RpcTimeout, SubmitOutcome, TARGET_TIME,
+    TimestampMode, build_full_block, load_sentences_from_file, min_difficulty_boundary, preflight,
+    seed_counter, submit_block,
 };
 
 use dotenvy::var;
@@ -187,6 +188,20 @@ fn clean(value: String) -> String {
 
 fn required(key: &str) -> MinerResult<String> {
     var(key).map_err(|_| format!("{key} missing from environment/.env").into())
+}
+
+/// `EXTRANONCE_MODE`: `strings` (default) draws from the corpus in
+/// `STRINGS_FILE`, `counter` pushes an incrementing script number and needs no
+/// strings file at all.
+fn resolve_extranonce_mode() -> MinerResult<bool> {
+    match var("EXTRANONCE_MODE") {
+        Err(_) => Ok(false),
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "" | "strings" => Ok(false),
+            "counter" => Ok(true),
+            other => Err(format!("EXTRANONCE_MODE={other:?} is not one of strings|counter").into()),
+        },
+    }
 }
 
 /// Workers are CPU-bound, so running more of them than the CPUs this process
@@ -413,20 +428,43 @@ async fn main() -> MinerResult<()> {
             .unwrap_or(1)
             .max(1),
     );
+
+    let counter_nonce = resolve_extranonce_mode()?;
+    COUNTER_EXTRANONCE.store(counter_nonce, Ordering::Relaxed);
+    if counter_nonce {
+        // Random start: a restart at the same height would otherwise replay the
+        // previous run's coinbases and repeat work already done.
+        seed_counter(fastrand::u64(..));
+    }
+
     let rpc_url = required("RPC_URL")?;
     let rpc_user = clean(required("RPC_USER")?);
     let rpc_pass = clean(required("RPC_PASS")?);
-    let strings_file = required("STRINGS_FILE")?;
+    let strings_file = if counter_nonce {
+        None
+    } else {
+        Some(required("STRINGS_FILE")?)
+    };
 
     println!(
         "[env] rpc_url={rpc_url} rpc_user={rpc_user:?} pass_len={} num_tasks={num_tasks}",
         rpc_pass.len()
     );
+    println!(
+        "[env] extranonce={}",
+        if counter_nonce {
+            "counter (script number after the height push)"
+        } else {
+            "strings"
+        }
+    );
 
     let client = Arc::new(Client::builder().timeout(Duration::from_secs(30)).build()?);
 
     preflight(&client, &rpc_url, &rpc_user, &rpc_pass).await?;
-    load_sentences_from_file(&strings_file)?;
+    if let Some(path) = strings_file.as_deref() {
+        load_sentences_from_file(path)?;
+    }
     // Before any worker starts: validates the whole address file and installs
     // the first payout address, so no worker ever sees `None` at startup.
     init_addresses().await?;

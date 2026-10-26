@@ -256,6 +256,42 @@ pub async fn preflight(
 // Extranonce corpus
 // ---------------------------------------------------------------------------
 
+/// Whether the coinbase extra nonce is a counter (`true`) or the sentence
+/// corpus (`false`). Set once from `EXTRANONCE_MODE` during startup.
+pub static COUNTER_EXTRANONCE: AtomicBool = AtomicBool::new(false);
+
+/// Source of `Extranonce::Counter` values. Process-global, so two workers never
+/// take the same value even if they build a coinbase at the same moment.
+static EXTRANONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Counter values are masked into `0..=i64::MAX`, the largest positive script
+/// number `push_int` can encode.
+///
+/// Both ends need this. A random seed in the full `u64` range exceeds the
+/// script number range immediately — half of all seeds do — and an unmasked
+/// counter would exceed it after 2^63 coinbases. Masking keeps the encoding
+/// total, so `build_coinbase_tx` cannot fail for a counter it produced itself.
+const COUNTER_MASK: u64 = i64::MAX as u64;
+
+/// Next counter value. Each coinbase takes a fresh one.
+pub fn next_counter() -> u64 {
+    EXTRANONCE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed) & COUNTER_MASK
+}
+
+/// Sets the counter's starting value, masked into the encodable range.
+pub fn seed_counter(start: u64) {
+    EXTRANONCE_COUNTER.store(start & COUNTER_MASK, AtomicOrdering::Relaxed);
+}
+
+/// What fills the extra nonce in the coinbase scriptSig.
+pub enum Extranonce {
+    /// Verbatim bytes appended with no push framing. The scriptSig is never
+    /// executed, so this is valid and costs one byte fewer than a push.
+    Text(Vec<u8>),
+    /// A minimally encoded script number, pushed after the height commitment.
+    Counter(u64),
+}
+
 fn truncate_utf8(s: &mut String, max: usize) {
     if s.len() <= max {
         return;
@@ -388,7 +424,7 @@ pub fn payout_script(address: &str) -> MinerResult<ScriptBuf> {
 pub fn build_coinbase_tx(
     height: u32,
     aux_flags: &[u8],
-    extra: &[u8],
+    extra: Extranonce,
     reward: u64,
     payout_spk: &ScriptBuf,
 ) -> MinerResult<Transaction> {
@@ -399,16 +435,39 @@ pub fn build_coinbase_tx(
         .into_script()
         .into_bytes();
 
-    // Raw append, not push_slice: the coinbase scriptSig is never executed, only
-    // its length and leading height push are checked, and push_slice would add a
-    // PUSHDATA opcode (and a stray OP_0 for empty input).
+    // Appended verbatim: BIP34 constrains only the height prefix, and the
+    // coinbase scriptSig is never executed, so nothing after it needs framing.
     script_sig.extend_from_slice(aux_flags);
 
-    let budget = MAX_CB_SCRIPT.saturating_sub(script_sig.len());
-    if extra.len() > budget {
-        script_sig.extend_from_slice(&extra[..budget]);
-    } else {
-        script_sig.extend_from_slice(extra);
+    match extra {
+        Extranonce::Text(bytes) => {
+            // Raw append, not push_slice: push_slice would add a PUSHDATA opcode
+            // (and a stray OP_0 for empty input). Truncation is safe here
+            // because the bytes carry no structure to corrupt.
+            let budget = MAX_CB_SCRIPT.saturating_sub(script_sig.len());
+            script_sig.extend_from_slice(&bytes[..bytes.len().min(budget)]);
+        }
+        Extranonce::Counter(n) => {
+            // A real push, so the scriptSig stays parseable and the counter
+            // reads as a number to anyone looking at the block.
+            let n = i64::try_from(n)
+                .map_err(|_| format!("extranonce counter {n} exceeds the script number range"))?;
+            let push = Builder::new().push_int(n).into_script().into_bytes();
+
+            // Refused rather than truncated: cutting a push mid-payload would
+            // leave an opcode claiming bytes that are not there.
+            if script_sig.len() + push.len() > MAX_CB_SCRIPT {
+                return Err(format!(
+                    "coinbase scriptSig would be {} bytes, over the {MAX_CB_SCRIPT}-byte \
+                     limit (height push, {} bytes of aux flags, {}-byte counter push)",
+                    script_sig.len() + push.len(),
+                    aux_flags.len(),
+                    push.len(),
+                )
+                .into());
+            }
+            script_sig.extend_from_slice(&push);
+        }
     }
 
     while script_sig.len() < MIN_CB_SCRIPT {
@@ -1086,5 +1145,49 @@ mod tests {
         assert!(payout_script("0xabc").is_err()); // odd number of digits
         assert!(payout_script("0xzz").is_err()); // not hex
         assert!(payout_script("0xab").is_ok()); // one byte is a script
+    }
+
+    fn coinbase_with(height: u32, aux: &[u8], extra: Extranonce) -> Transaction {
+        let spk = payout_script("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").unwrap();
+        build_coinbase_tx(height, aux, extra, 5_000_000_000, &spk).unwrap()
+    }
+
+    #[test]
+    fn counter_extranonce_is_a_minimal_script_number_push() {
+        // Height 100 -> push `01 64`; counter 5 -> OP_5.
+        let tx = coinbase_with(100, &[], Extranonce::Counter(5));
+        assert_eq!(tx.input[0].script_sig.as_bytes(), &[0x01u8, 0x64, 0x55][..]);
+
+        // 0 -> OP_0. Past OP_16, so 17 becomes a one-byte data push.
+        let tx = coinbase_with(100, &[], Extranonce::Counter(0));
+        assert_eq!(tx.input[0].script_sig.as_bytes(), &[0x01u8, 0x64, 0x00][..]);
+        let tx = coinbase_with(100, &[], Extranonce::Counter(17));
+        assert_eq!(
+            tx.input[0].script_sig.as_bytes(),
+            &[0x01u8, 0x64, 0x01, 0x11][..]
+        );
+
+        // Aux flags sit between the height push and the counter.
+        let tx = coinbase_with(100, &[0xaa], Extranonce::Counter(5));
+        assert_eq!(
+            tx.input[0].script_sig.as_bytes(),
+            &[0x01u8, 0x64, 0xaa, 0x55][..]
+        );
+    }
+
+    #[test]
+    fn text_extranonce_is_appended_verbatim() {
+        let tx = coinbase_with(100, &[], Extranonce::Text(b"hi".to_vec()));
+        assert_eq!(
+            tx.input[0].script_sig.as_bytes(),
+            &[0x01u8, 0x64, b'h', b'i'][..]
+        );
+    }
+
+    #[test]
+    fn distinct_counters_give_distinct_coinbases() {
+        let a = coinbase_with(100, &[], Extranonce::Counter(1));
+        let b = coinbase_with(100, &[], Extranonce::Counter(2));
+        assert_ne!(a.txid(), b.txid());
     }
 }
