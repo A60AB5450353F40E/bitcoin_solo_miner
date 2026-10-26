@@ -1,10 +1,10 @@
 use crate::block_template::check_target_time;
 use crate::merkle::{LAST_TXS, compute_root_from_branch};
 use crate::utils::{
-    COUNTER_EXTRANONCE, Extranonce, FALLBACK_MAX_BLOCK_BYTES, MIDSTATE_BYTES, MIN_DIFFICULTY_RULE,
-    Midstate, MinerResult, TAIL_BYTES, TAIL_NONCE_OFFSET, TimestampInputs, bits_to_target,
-    build_coinbase_tx, meets_target, next_counter, payout_script, predicted_block_size,
-    serialize_header_to_array, serialized_size,
+    EXTRANONCE_MODE, Extranonce, ExtranonceMode, FALLBACK_MAX_BLOCK_BYTES, MIDSTATE_BYTES,
+    MIN_DIFFICULTY_RULE, Midstate, MinerResult, TAIL_BYTES, TAIL_NONCE_OFFSET, TimestampInputs,
+    bits_to_target, build_coinbase_tx, meets_target, minimal_nonce, next_counter, payout_script,
+    predicted_block_size, serialize_header_to_array, serialized_size,
 };
 use crate::{BLOCK_TARGET, BLOCKS_ACCEPTED, GLOBAL_TEMPLATE, PAYOUT_ADDRESS, SENTENCES, STOPPING};
 use bitcoin::hashes::Hash;
@@ -256,12 +256,19 @@ pub async fn mine_loop() -> MinerResult<Option<MinedBlock>> {
         _ => Vec::new(),
     };
 
-    // Counter mode removes the strings-file dependency and makes the coinbase
-    // unique by construction; strings mode keeps the sentence corpus.
-    let extra = if COUNTER_EXTRANONCE.load(Ordering::Relaxed) {
-        Extranonce::Counter(next_counter())
-    } else {
-        Extranonce::Text(pick_random_sentence().into_bytes())
+    // Minimal mode spends its entropy in two places so the coinbase stays small:
+    // 22 bits as a three-byte script number, 16 bits in nLockTime.
+    let (extra, lock_time) = match EXTRANONCE_MODE
+        .get()
+        .copied()
+        .unwrap_or(ExtranonceMode::Strings)
+    {
+        ExtranonceMode::Strings => (Extranonce::Text(pick_random_sentence().into_bytes()), 0),
+        ExtranonceMode::Counter => (Extranonce::ScriptNum(next_counter()), 0),
+        ExtranonceMode::Minimal => {
+            let (script_num, lock_time) = minimal_nonce();
+            (Extranonce::ScriptNum(script_num), lock_time)
+        }
     };
 
     // Single coinbase. No dummy pass, no wtxid tree, no commitment output.
@@ -273,6 +280,7 @@ pub async fn mine_loop() -> MinerResult<Option<MinedBlock>> {
         extra,
         template.coinbasevalue,
         &payout_spk,
+        lock_time,
     )?;
 
     // Exact size check before any hashing: the only reason to skip a template is

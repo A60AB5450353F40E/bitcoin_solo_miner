@@ -12,9 +12,9 @@ use mine::mine_loop;
 
 mod utils;
 use utils::{
-    COUNTER_EXTRANONCE, MIN_DIFFICULTY_RULE, MinerResult, RpcTimeout, SubmitOutcome, TARGET_TIME,
-    TimestampMode, build_full_block, load_sentences_from_file, min_difficulty_boundary, preflight,
-    seed_counter, submit_block,
+    EXTRANONCE_MODE, ExtranonceMode, MIN_DIFFICULTY_RULE, MinerResult, RpcTimeout, SubmitOutcome,
+    TARGET_TIME, TimestampMode, build_full_block, load_sentences_from_file,
+    min_difficulty_boundary, preflight, seed_counter, submit_block,
 };
 
 use dotenvy::var;
@@ -193,13 +193,17 @@ fn required(key: &str) -> MinerResult<String> {
 /// `EXTRANONCE_MODE`: `strings` (default) draws from the corpus in
 /// `STRINGS_FILE`, `counter` pushes an incrementing script number and needs no
 /// strings file at all.
-fn resolve_extranonce_mode() -> MinerResult<bool> {
+fn resolve_extranonce_mode() -> MinerResult<ExtranonceMode> {
     match var("EXTRANONCE_MODE") {
-        Err(_) => Ok(false),
+        Err(_) => Ok(ExtranonceMode::Strings),
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "" | "strings" => Ok(false),
-            "counter" => Ok(true),
-            other => Err(format!("EXTRANONCE_MODE={other:?} is not one of strings|counter").into()),
+            "" | "strings" => Ok(ExtranonceMode::Strings),
+            "counter" => Ok(ExtranonceMode::Counter),
+            "minimal" => Ok(ExtranonceMode::Minimal),
+            other => Err(format!(
+                "EXTRANONCE_MODE={other:?} is not one of strings|counter|minimal"
+            )
+            .into()),
         },
     }
 }
@@ -429,22 +433,23 @@ async fn main() -> MinerResult<()> {
             .max(1),
     );
 
-    let counter_nonce = resolve_extranonce_mode()?;
-    COUNTER_EXTRANONCE.store(counter_nonce, Ordering::Relaxed);
-    if counter_nonce {
+    let extranonce_mode = resolve_extranonce_mode()?;
+    let _ = EXTRANONCE_MODE.set(extranonce_mode);
+    if extranonce_mode == ExtranonceMode::Counter {
         // Random start: a restart at the same height would otherwise replay the
-        // previous run's coinbases and repeat work already done.
+        // previous run's coinbases. Minimal draws fresh randomness per coinbase
+        // and needs no seed.
         seed_counter(fastrand::u64(..));
     }
+
+    let strings_file = match extranonce_mode {
+        ExtranonceMode::Strings => Some(required("STRINGS_FILE")?),
+        ExtranonceMode::Counter | ExtranonceMode::Minimal => None,
+    };
 
     let rpc_url = required("RPC_URL")?;
     let rpc_user = clean(required("RPC_USER")?);
     let rpc_pass = clean(required("RPC_PASS")?);
-    let strings_file = if counter_nonce {
-        None
-    } else {
-        Some(required("STRINGS_FILE")?)
-    };
 
     println!(
         "[env] rpc_url={rpc_url} rpc_user={rpc_user:?} pass_len={} num_tasks={num_tasks}",
@@ -452,10 +457,11 @@ async fn main() -> MinerResult<()> {
     );
     println!(
         "[env] extranonce={}",
-        if counter_nonce {
-            "counter (script number after the height push)"
-        } else {
-            "strings"
+        match extranonce_mode {
+            ExtranonceMode::Strings => "strings",
+            ExtranonceMode::Counter => "counter (script number after the height push)",
+            ExtranonceMode::Minimal =>
+                "minimal (22-bit script number in scriptSig, 16-bit nLockTime)",
         }
     );
 
