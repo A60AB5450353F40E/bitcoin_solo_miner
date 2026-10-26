@@ -182,8 +182,15 @@ pub async fn mine_loop() -> MinerResult<Option<MinedBlock>> {
         Some(addr) => addr.clone(),
         None => {
             // With a target set an empty list is fatal: no candidate can ever
-            // be produced, so a wrapper would wait on RUN_DONE forever.
-            if BLOCK_TARGET.get().is_some() {
+            // be produced, so a wrapper would wait on RUN_DONE forever. Skipped
+            // once the count is met, because `advance_after_block` clears
+            // PAYOUT_ADDRESS *before* the winning worker calls
+            // record_accepted_block, so another worker arriving in that window
+            // would otherwise report a failure for a run that succeeded.
+            if BLOCK_TARGET
+                .get()
+                .is_some_and(|target| BLOCKS_ACCEPTED.load(Ordering::Relaxed) < *target)
+            {
                 crate::fail(format!(
                     "no payout address with --count set, after {} accepted block(s); \
                      add addresses or set ADDRESS_MODE=loop",

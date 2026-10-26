@@ -67,8 +67,13 @@ static RUN_ERROR: Lazy<std::sync::Mutex<Option<String>>> =
 const USAGE: &str = "\
 usage: bch_solo_miner [--count N]
 
-  -n, --count N   mine N blocks, then exit 0
+  -n, --count N   mine N accepted blocks, then exit 0
   -h, --help      show this message
+
+With more than one worker the count is a target, not a cap: workers already
+searching when it is reached may still find a block, and a submit in flight is
+abandoned when the process exits. Nothing detects a dead node mid-run, so a
+wrapper should apply its own timeout after starting the miner.
 
 Everything else comes from .env.";
 
@@ -496,23 +501,28 @@ async fn main() -> MinerResult<()> {
 
     match BLOCK_TARGET.get() {
         Some(target) => {
+            // `Notify` stores a permit, so a worker that reaches the target
+            // before this await is not missed.
             RUN_DONE.notified().await;
+
             let accepted = BLOCKS_ACCEPTED.load(Ordering::Relaxed);
             let error = match RUN_ERROR.lock() {
                 Ok(mut g) => g.take(),
                 Err(p) => p.into_inner().take(),
             };
+
             if let Some(reason) = error {
-                // The count decides, not the error. A worker that saw the
-                // exhausted address list between the winning worker's cursor
-                // advance and its record_accepted_block call reports a failure
-                // for a run that met its target.
+                // `mine_loop` only reports exhaustion while the count is short,
+                // so this cannot normally fire after a successful run. Kept as
+                // a backstop for any future `fail` caller: the count decides,
+                // not the error message.
                 if accepted < *target {
                     eprintln!("{reason}");
                     std::process::exit(1);
                 }
                 eprintln!("[run] note: {reason} (target already met)");
             }
+
             println!("[run] accepted {accepted} block(s), target {target}; exiting");
         }
         // No target: mine until the process is killed.
