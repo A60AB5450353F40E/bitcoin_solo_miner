@@ -447,6 +447,90 @@ pub fn payout_script(address: &str) -> MinerResult<ScriptBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Coinbase finality policy
+// ---------------------------------------------------------------------------
+
+/// `nSequence` for a coinbase whose `nLockTime` is the parent's height.
+///
+/// On the wire this is `fe ff ff ff`: `Sequence` is a `u32` serialized
+/// little-endian. That is "final minus one", so `nLockTime` is honoured
+/// instead of being ignored. The `u32` literal `0xfeff_ffff` would serialize
+/// as `ff ff ff fe` and is a different value.
+const PREV_HEIGHT_SEQUENCE: u32 = 0xffff_fffe;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoinbaseLockTime {
+    /// `nLockTime = 0`, `nSequence = 0xffffffff`: no finality dependency.
+    None,
+    /// `nLockTime = height - 1` (the parent's height), `nSequence = 0xfffffffe`.
+    PrevHeight,
+}
+
+/// Set once from `COINBASE_LOCKTIME` before any worker starts.
+pub static COINBASE_LOCKTIME: OnceCell<CoinbaseLockTime> = OnceCell::new();
+
+/// `COINBASE_LOCKTIME`: `none` (default) or `prev_height` (`bip54` accepted as
+/// a synonym, since that is the name the operator will reach for).
+pub fn resolve_coinbase_locktime() -> MinerResult<CoinbaseLockTime> {
+    let raw = match dotenvy::var("COINBASE_LOCKTIME") {
+        Ok(v) => v,
+        Err(_) => return Ok(CoinbaseLockTime::None),
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "none" | "off" | "0" => Ok(CoinbaseLockTime::None),
+        "prev_height" | "bip54" => Ok(CoinbaseLockTime::PrevHeight),
+        other => Err(format!(
+            "COINBASE_LOCKTIME={other:?} is not one of none|prev_height"
+        )
+        .into()),
+    }
+}
+
+impl CoinbaseLockTime {
+    /// `(nLockTime, nSequence)` for the coinbase of the block at `height`.
+    ///
+    /// `lock_time` is whatever the extranonce mode chose and is replaced only
+    /// by `PrevHeight`.
+    ///
+    /// `height - 1`, not `height`: `IsFinalTx` calls a transaction final when
+    /// its `nLockTime` is strictly below the height it is validated at. The
+    /// parent's height is below every validation height, so the coinbase stays
+    /// final. Stamping `height` would sit on the boundary, be non-final, and
+    /// with a non-final sequence be refused as `bad-txns-nonfinal`.
+    ///
+    /// Block-height mode is selected by the value being under
+    /// `LOCKTIME_THRESHOLD` (500,000,000), which every chain this miner targets
+    /// is. At height 0 there is no parent, and 0 disables the field, which is
+    /// final.
+    pub fn apply(self, height: u32, lock_time: u32) -> (u32, Sequence) {
+        match self {
+            CoinbaseLockTime::None => (lock_time, Sequence::MAX),
+            CoinbaseLockTime::PrevHeight => (
+                height.saturating_sub(1),
+                Sequence::from_consensus(PREV_HEIGHT_SEQUENCE),
+            ),
+        }
+    }
+}
+
+/// `minimal` spends 16 bits of coinbase entropy in `nLockTime`; a fixed lock
+/// time would overwrite all of it.
+pub fn check_coinbase_locktime_mode(
+    mode: ExtranonceMode,
+    policy: CoinbaseLockTime,
+) -> MinerResult<()> {
+    if mode == ExtranonceMode::Minimal && policy != CoinbaseLockTime::None {
+        return Err(
+            "EXTRANONCE_MODE=minimal puts 16 bits of entropy in nLockTime, which \
+             COINBASE_LOCKTIME=prev_height would overwrite; use strings/counter \
+             with prev_height, or minimal with COINBASE_LOCKTIME=none"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Coinbase
 // ---------------------------------------------------------------------------
 
@@ -459,6 +543,7 @@ pub fn build_coinbase_tx(
     reward: u64,
     payout_spk: &ScriptBuf,
     lock_time: u32,
+    sequence: Sequence, // NEW
 ) -> MinerResult<Transaction> {
     // push_int emits OP_0 / OP_1..OP_16 / minimal CScriptNum. At height 334148
     // this is `03 44 19 05`, which satisfies BIP34's check.
@@ -515,8 +600,8 @@ pub fn build_coinbase_tx(
         input: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: script_sig.into(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(), // BCH: always empty
+            sequence, // was Sequence::MAX
+            witness: Witness::new(),
         }],
         output: vec![TxOut {
             value: Amount::from_sat(reward),
@@ -1119,7 +1204,7 @@ mod tests {
 
     fn coinbase_with(height: u32, aux: &[u8], extra: Extranonce, lock_time: u32) -> Transaction {
         let spk = payout_script("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").unwrap();
-        build_coinbase_tx(height, aux, extra, 5_000_000_000, &spk, lock_time).unwrap()
+        build_coinbase_tx(height, aux, extra, 5_000_000_000, &spk, lock_time, Sequence::MAX).unwrap()
     }
 
     #[test]
@@ -1215,6 +1300,7 @@ mod tests {
             1,
             &empty,
             0xdead,
+            Sequence::MAX, // keeps the 65-byte and sequence==MAX assertions valid
         )
         .unwrap();
 
@@ -1330,5 +1416,106 @@ mod tests {
             assert!(time >= curtime, "curtime={curtime}");
             assert!(time >= i.mintime, "curtime={curtime}");
         }
+    }
+
+    /// Literal transcription of Core's `IsFinalTx` for a height-based lock
+    /// time, evaluated at `block_height`, with all input sequences equal.
+    fn is_final(lock_time: u32, sequence: Sequence, block_height: u32) -> bool {
+        const LOCKTIME_THRESHOLD: u32 = 500_000_000;
+        if lock_time == 0 {
+            return true;
+        }
+        // Every fixture here is a height, never a timestamp.
+        assert!(lock_time < LOCKTIME_THRESHOLD && block_height < LOCKTIME_THRESHOLD);
+        if lock_time < block_height {
+            return true;
+        }
+        sequence == Sequence::MAX
+    }
+
+    #[test]
+    fn prev_height_locktime_is_final_and_own_height_is_not() {
+        for height in [1u32, 2, 100, 900_000] {
+            let (lock_time, sequence) = CoinbaseLockTime::PrevHeight.apply(height, 0);
+            assert_eq!(lock_time, height - 1);
+            assert!(
+                is_final(lock_time, sequence, height),
+                "height={height} lock_time={lock_time} is not final"
+            );
+
+            // The trap: this block's own height lands on the boundary.
+            assert!(
+                !is_final(height, sequence, height),
+                "height={height} as the lock time should be non-final"
+            );
+        }
+    }
+
+    #[test]
+    fn prev_height_sequence_is_the_little_endian_fe_ffffff() {
+        let (_, sequence) = CoinbaseLockTime::PrevHeight.apply(10, 0);
+        assert_eq!(
+            sequence.to_consensus_u32().to_le_bytes(),
+            [0xfe, 0xff, 0xff, 0xff]
+        );
+        // Not the u32 0xfeffffff, which would serialize as ff ff ff fe.
+        assert_ne!(sequence.to_consensus_u32(), 0xfeff_ffff);
+    }
+
+    #[test]
+    fn none_policy_preserves_the_existing_coinbase() {
+        let (lock_time, sequence) = CoinbaseLockTime::None.apply(900_000, 0);
+        assert_eq!(lock_time, 0);
+        assert_eq!(sequence, Sequence::MAX);
+
+        // Minimal mode's lock-time entropy passes through untouched.
+        assert_eq!(CoinbaseLockTime::None.apply(900_000, 0xdead).0, 0xdead);
+    }
+
+    #[test]
+    fn locktime_policy_changes_the_coinbase_txid_but_not_its_size() {
+        let spk = payout_script("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").unwrap();
+        let plain = build_coinbase_tx(
+            1004, &[], Extranonce::ScriptNum(7), 5_000_000_000, &spk, 0, Sequence::MAX,
+        )
+        .unwrap();
+        let (lock_time, sequence) = CoinbaseLockTime::PrevHeight.apply(1004, 0);
+        let bip = build_coinbase_tx(
+            1004, &[], Extranonce::ScriptNum(7), 5_000_000_000, &spk, lock_time, sequence,
+        )
+        .unwrap();
+
+        assert_ne!(plain.txid(), bip.txid());
+        assert_eq!(bip.lock_time, LockTime::from_consensus(1003));
+        assert_eq!(
+            serialized_size(&plain).unwrap(),
+            serialized_size(&bip).unwrap()
+        );
+    }
+
+    #[test]
+    fn height_zero_has_no_parent_and_disables_the_field() {
+        let (lock_time, sequence) = CoinbaseLockTime::PrevHeight.apply(0, 0);
+        assert_eq!(lock_time, 0);
+        assert!(is_final(lock_time, sequence, 0));
+    }
+
+    #[test]
+    fn minimal_mode_and_a_fixed_lock_time_are_refused() {
+        assert!(check_coinbase_locktime_mode(
+            ExtranonceMode::Minimal,
+            CoinbaseLockTime::PrevHeight
+        )
+        .is_err());
+        assert!(check_coinbase_locktime_mode(
+            ExtranonceMode::Minimal,
+            CoinbaseLockTime::None
+        )
+        .is_ok());
+        assert!(check_coinbase_locktime_mode(
+            ExtranonceMode::Strings,
+            CoinbaseLockTime::PrevHeight
+        )
+        .is_ok());
     }
 }

@@ -14,7 +14,8 @@ mod utils;
 use utils::{
     EXTRANONCE_MODE, ExtranonceMode, MIN_DIFFICULTY_RULE, MinerResult, RpcTimeout, SubmitOutcome,
     TARGET_TIME, TimestampMode, build_full_block, load_sentences_from_file,
-    min_difficulty_boundary, preflight, seed_counter, submit_block,
+    min_difficulty_boundary, preflight, seed_counter, submit_block, CoinbaseLockTime, COINBASE_LOCKTIME,
+    check_coinbase_locktime_mode, resolve_coinbase_locktime
 };
 
 use dotenvy::var;
@@ -442,6 +443,10 @@ async fn main() -> MinerResult<()> {
         seed_counter(fastrand::u64(..));
     }
 
+    let coinbase_locktime = resolve_coinbase_locktime()?;
+    check_coinbase_locktime_mode(extranonce_mode, coinbase_locktime)?;
+    let _ = COINBASE_LOCKTIME.set(coinbase_locktime);
+
     let strings_file = match extranonce_mode {
         ExtranonceMode::Strings => Some(required("STRINGS_FILE")?),
         ExtranonceMode::Counter | ExtranonceMode::Minimal => None,
@@ -462,6 +467,14 @@ async fn main() -> MinerResult<()> {
             ExtranonceMode::Counter => "counter (script number after the height push)",
             ExtranonceMode::Minimal =>
                 "minimal (22-bit script number in scriptSig, 16-bit nLockTime)",
+        }
+    );
+    println!(
+        "[env] coinbase_locktime={}",
+        match coinbase_locktime {
+            CoinbaseLockTime::None => "none (nLockTime=0, nSequence=0xffffffff)",
+            CoinbaseLockTime::PrevHeight =>
+                "prev_height (nLockTime=height-1, nSequence=0xfffffffe)",
         }
     );
 

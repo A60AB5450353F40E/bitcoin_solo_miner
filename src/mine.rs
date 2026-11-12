@@ -4,7 +4,7 @@ use crate::utils::{
     EXTRANONCE_MODE, Extranonce, ExtranonceMode, FALLBACK_MAX_BLOCK_BYTES, MIDSTATE_BYTES,
     MIN_DIFFICULTY_RULE, Midstate, MinerResult, TAIL_BYTES, TAIL_NONCE_OFFSET, TimestampInputs,
     bits_to_target, build_coinbase_tx, meets_target, minimal_nonce, next_counter, payout_script,
-    predicted_block_size, serialize_header_to_array, serialized_size,
+    predicted_block_size, serialize_header_to_array, serialized_size, CoinbaseLockTime, COINBASE_LOCKTIME
 };
 use crate::{BLOCK_TARGET, BLOCKS_ACCEPTED, GLOBAL_TEMPLATE, PAYOUT_ADDRESS, SENTENCES, STOPPING};
 use bitcoin::hashes::Hash;
@@ -271,6 +271,14 @@ pub async fn mine_loop() -> MinerResult<Option<MinedBlock>> {
         }
     };
 
+    // Refused in combination with `minimal` at startup, so `lock_time` here is
+    // either the mode's own value or overwritten by the policy.
+    let (lock_time, sequence) = COINBASE_LOCKTIME
+        .get()
+        .copied()
+        .unwrap_or(CoinbaseLockTime::None)
+        .apply(template.height as u32, lock_time);
+
     // Single coinbase. No dummy pass, no wtxid tree, no commitment output.
     // `coinbasevalue` is used verbatim because every template transaction is in
     // this block: it is the maximum legal coinbase input, and we claim all of it.
@@ -281,6 +289,7 @@ pub async fn mine_loop() -> MinerResult<Option<MinedBlock>> {
         template.coinbasevalue,
         &payout_spk,
         lock_time,
+        sequence,
     )?;
 
     // Exact size check before any hashing: the only reason to skip a template is
